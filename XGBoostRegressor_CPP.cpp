@@ -1,6 +1,10 @@
-// Creator : Sarvesh Joshi
-// Date of creation: 14/7/2025
-// Last updated: 14/7/2025
+
+
+// LAST UPDATED - 16/7/2025
+// Update 1 ---
+// 1.1 Fixed bug in build_tree around line 317
+// 1.2 Major rework. Replaced raw pointers with smart pointers to objects of class Round,class Node, class Tree. Must use raw pointers safely when
+// accesing via container though.
 
 #include <algorithm>
 #include <cctype>
@@ -8,6 +12,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <queue>
 #include <random>
@@ -33,14 +38,14 @@ template<typename T> class Node {
 		int depth;
 		vector<double> Gradients;
 		vector<double> Hessians;
-		T data;
-		Node<T>* left = nullptr;
-		Node<T>* right = nullptr;
+		vector<vector<T>> data;
+		unique_ptr<Node<T>> left = nullptr;
+		unique_ptr<Node<T>> right = nullptr;
 		bool is_leaf = false;
 
 		// initialize node with constructor
 		Node(int feature = -1, double split_value = (double)-1, int depth = 0, vector<double> Gradients = {-1}, vector<double> Hessians = {-1},
-			 T data = T{})
+			 vector<vector<T>> data = {{T{}}})
 			: feature{feature}, split_value{split_value}, depth{depth}, Gradients{Gradients}, Hessians{Hessians}, data{data} {
 
 			is_leaf = (feature == -1) ? true : false;
@@ -76,10 +81,13 @@ template<typename T> class Node {
 		}
 };
 
-class Tree {
+template<typename T> class Tree {
 	public:
-		Node<vector<vector<double>>>* root;
-		Tree(Node<vector<vector<double>>>* root = nullptr) : root{root} {};
+		unique_ptr<Node<T>> root;
+
+		Tree(unique_ptr<Node<T>> root_ptr = nullptr) {
+			root = move(root_ptr);
+		};
 };
 
 class XGBoostRegressor {
@@ -154,20 +162,25 @@ class XGBoostRegressor {
 
 		class Round {
 			private:
-				Tree* tree = nullptr;
+				unique_ptr<Tree<double>> tree;
 				int round_num;
 				vector<double> Gradients = {};
 				vector<double> Hessians = {};
-				vector<Node<vector<vector<double>>>*> leaves;
-				vector<Node<vector<vector<double>>>*> nodes;
+
+				// I removed this because i dont want to keep raw pointers to Nodes stored. If someone tampers with a Node using this then it can lead
+				// to problems! This would only be useful for debugging.
+
+				// vector<Node<double>*> leaves;
+				// vector<Node<double>*> nodes;
+
 				XGBoostRegressor* model;
 
 			public:
-				// init constructor for class Round
-				Tree* get_tree() {
+				const unique_ptr<Tree<double>>& get_tree() const {
 					return tree;
 				}
 
+				// init constructor for class Round
 				Round(int round_num = 0, XGBoostRegressor* model = nullptr) : round_num{round_num}, model{model} {
 				}
 
@@ -260,28 +273,36 @@ class XGBoostRegressor {
 
 				//----------------------------------------------------------
 
-				Node<vector<vector<double>>>* create_node(const vector<vector<double>>& data, const int depth, const vector<double>& grads_node,
-														  const vector<double>& hess_node) {
+				unique_ptr<Node<double>> create_node(const vector<vector<double>>& data, const int depth, const vector<double>& grads_node,
+													 const vector<double>& hess_node) {
 					pair<int, double> info = find_split_value(data, grads_node, hess_node);
-					Node<vector<vector<double>>>* new_node = new Node(info.first, info.second, depth, grads_node, hess_node, data);
-					this->nodes.push_back(new_node);
+					unique_ptr<Node<double>> new_node = make_unique<Node<double>>(info.first, info.second, depth, grads_node, hess_node, data);
 					return new_node;
+
+					// imp -- Ownership is moved to outer variable automatically when a unique_ptr is returned from a function.
 				}
 
 				// build tree using queue (like bfs)
 				void build_tree(const vector<vector<double>>& X) {
 					int curr_depth = 1;
-					Node<vector<vector<double>>>* root = create_node(X, curr_depth, this->Gradients, this->Hessians);
-					this->tree = new Tree(root);
-					queue<Node<vector<vector<double>>>*> q;
-					q.push(root);
+
+					unique_ptr<Node<double>> root = create_node(X, curr_depth, this->Gradients, this->Hessians);
+
+					tree = make_unique<Tree<double>>(move(root));
+					queue<Node<double>*> q;
+					q.push(this->tree->root.get());
+
+					// calling get() just creates a copy of the raw pointer which is then automatically popped from the stack after this function
+					// terminates
 
 					while(!q.empty()) {
-						Node<vector<vector<double>>>* curr_node = q.front();
+						Node<double>* curr_node = q.front();
 						q.pop();
+
 						if(curr_node->depth >= this->model->max_depth) {
 							curr_node->is_leaf = true;
-							leaves.push_back(curr_node);
+							// leaves.push_back(*curr_node);
+							//  nodes.push_back(move(curr_node));
 							continue;
 						}
 						if(!(curr_node->is_leaf)) {
@@ -296,8 +317,9 @@ class XGBoostRegressor {
 							vector<int> index_right;
 
 							// creating index masks for split data
-							for(int i = 0; i < X.size(); i++) {
-								if(X[i][curr_feature] < curr_split_value) {
+							// SMALL BUG HERE. WAS USING ENTIRE X INSTEAD OF curr_node->data
+							for(int i = 0; i < curr_node->data.size(); i++) {
+								if(curr_node->data[i][curr_feature] < curr_split_value) {
 									index_left.push_back(i);
 								} else {
 									index_right.push_back(i);
@@ -313,30 +335,31 @@ class XGBoostRegressor {
 								vector<double> hess_right;
 
 								for(auto idx : index_left) {
-									data_left.push_back(X[idx]);
+									data_left.push_back(curr_node->data[idx]);
 									grads_left.push_back(curr_grads[idx]);
 									hess_left.push_back(curr_hess[idx]);
 								}
 								for(auto idx : index_right) {
-									data_right.push_back(X[idx]);
+									data_right.push_back(curr_node->data[idx]);
 									grads_right.push_back(curr_grads[idx]);
 									hess_right.push_back(curr_hess[idx]);
 								}
 
 								curr_node->left = create_node(data_left, curr_depth + 1, grads_left, hess_left);
 								curr_node->right = create_node(data_right, curr_depth + 1, grads_right, hess_right);
-								q.push(curr_node->left);
-								q.push(curr_node->right);
+								q.push(curr_node->left.get());
+								q.push(curr_node->right.get());
 							}
 
-							else {
-								leaves.push_back(curr_node);
-							}
+							// else {
+							// 	leaves.push_back(curr_node);
+							// }
 						}
 
-						else {
-							leaves.push_back(curr_node);
-						}
+						// else {
+						// 	leaves.push_back(*curr_node);
+						// }
+						// nodes.push_back(move(curr_node));
 					}
 				}
 
@@ -344,18 +367,22 @@ class XGBoostRegressor {
 
 				void evaluate_tree(const vector<vector<double>>& X, vector<double>& y_guess) {
 					if(this->tree->root == nullptr) {
-						cerr << "Tree is uninitialized. Call fit before transform";
+						cerr << "ValueError: Tree is uninitialized. Call fit before transform";
 						exit(1);
 					}
 					// traverse the tree per sample and get output from whichever leaf it reaches
+
+					// Understood when to use raw pointers over unique_ptr-- Whenever we want to store the ptrs in a container and use it to change
+					// smthg or "traverse"/"find" an object across multiple objects.
+
 					for(int i = 0; i < X.size(); i++) {
 						vector<double> curr_row = X[i];
-						Node<vector<vector<double>>>* curr_node = tree->root;
+						Node<double>* curr_node = this->tree->root.get();
 						while(!curr_node->is_leaf) {
 							if(curr_row[curr_node->feature] < curr_node->split_value) {
-								curr_node = curr_node->left;
+								curr_node = curr_node->left.get();
 							} else {
-								curr_node = curr_node->right;
+								curr_node = curr_node->right.get();
 							}
 						}
 
@@ -366,11 +393,11 @@ class XGBoostRegressor {
 		};
 
 	private:
-		vector<Round*> rounds;
+		vector<unique_ptr<Round>> rounds;
 
 	public:
-		Round* create_round(int round_num) {
-			Round* round = new Round(round_num, this);
+		unique_ptr<Round> create_round(int round_num) {
+			unique_ptr<Round> round = make_unique<Round>(round_num, this);
 			return round;
 		}
 
@@ -381,11 +408,11 @@ class XGBoostRegressor {
 			// Very Imp because same instance can be fitted on multiple data.
 
 			for(int i = 0; i < this->max_iter; i++) {
-				this->rounds.push_back(create_round(i));
+				this->rounds.push_back(move(create_round(i)));
 			}
 
-			for(auto round : rounds) {
-
+			for(int i = 0; i < rounds.size(); i++) {
+				Round* round = rounds[i].get();
 				tuple<vector<vector<double>>, vector<double>, vector<double>> sampled_data = subsample_data(X_train, y_train, y_guess, subsample);
 				round->compute_Grads(get<1>(sampled_data), get<2>(sampled_data));
 				round->build_tree(get<0>(sampled_data));
@@ -400,7 +427,8 @@ class XGBoostRegressor {
 				exit(1);
 			}
 			// int ct{};
-			for(auto round : rounds) {
+			for(int i = 0; i < rounds.size(); i++) {
+				Round* round = rounds[i].get();
 				round->evaluate_tree(X_test, y_guess);
 				if(round->get_tree()->root->left != nullptr) {
 					// ct++;
@@ -417,7 +445,7 @@ int main() {
 	// y = 2x[0] + 4x[1] +- noise;
 	vector<double> y_train;
 	mt19937 gen(29);
-	uniform_real_distribution<> dis(-0.25, 0.25);
+	uniform_real_distribution<> dis(-0.55, 0.55);
 	for(int i = 0; i < X_train.size(); i++) {
 		double noise = dis(gen);
 		y_train.push_back(2 * X_train[i][0] + 4 * X_train[i][1] + noise);
@@ -429,7 +457,7 @@ int main() {
 						   0.0,	  // lambda
 						   0.0,	  // alpha
 						   0.6,	  // learning rate
-						   50,	  // max_iter
+						   20,	  // max_iter
 						   0,	  // min_child_weight
 						   1.0	  // subsample
 	);
